@@ -40,7 +40,7 @@ library(pROC)
 
 # Read the data
 ```{r}
-data <- fread("C:/Users/MW/Desktop/MDS_556_Analytical_Methods/data/alz_data.csv")
+data <- fread("alz_data.csv")
 ```
 
 ```{r}
@@ -686,25 +686,3 @@ ggplot(roc_all, aes(x=FPR, y=TPR, color=name)) +
 # with(tree_roc, points(1 - FPR, TPR, col=1 + labels))
 
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

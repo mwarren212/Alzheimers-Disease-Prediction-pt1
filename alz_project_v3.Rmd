@@ -1,0 +1,710 @@
+---
+title: "Advanced Methods - Alzheimer's Disease Prediction Of Longitudinal Evolution (TADPOLE)"
+author: "Matthew Warren"
+output: word_document
+---
+
+# Data Set
+This data set was sourced from https://github.com/A2ed/springboard_data_science/tree/master/capstone_1_mri, which is a cleaned version of data from the Alzheimer's Disease Prediction Of Longitudinal Evolution (TADPOLE) Challenge and the Alzheimer's disease neuroimaging initiative (ADNI)(http://adni.loni.usc.edu/data-samples/access-data/). TADPOLE provides a list of individuals at an age that puts them at risk of AD. A history of informative measurements (from imaging, psychology, demographics, genetics, etc.) from each individual is available.
+
+Since it is a large dataset, I decided to select a subset that are numeric and mostly complete. The attributes being kept are the row ID, the classification of cognitve status(SMC and CN = cognitively normal, (E/L)MCI = mild cognitive impairment, AD = probable Alzheimer's Disease), scores on three different neuropsychological tests administered by a clinical expert(CDR Sum of Boxes (cdrsb_bl), ADAS13 (adas13_bl), and  MMSE (mmse_bl)), and three measures of brain structural integrity(ventricle volume (ventricles_bl), whole brain volume (wholebrain_bl), and Intracerebroventricular volume)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(magrittr)
+library(DataExplorer)
+library(openxlsx)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(tinytex)
+library(corrplot)
+library(qgraph)
+library(ggbiplot)
+library(dplyr)
+library(DMwR)
+library(ggvis)
+library(rpart)
+library(kernlab)
+library(lattice)
+library(nnet)
+library(ROCR)
+library(grid)
+library(class)
+library(caret)
+library(gridExtra)
+library(pROC)
+```
+
+# Read the data
+```{r}
+data <- fread("C:/Users/MW/Desktop/MDS_556_Analytical_Methods/data/alz_data.csv")
+```
+
+```{r}
+normalize <- function(x) {
+return ((x - min(x)) / (max(x) - min(x))) }
+```
+
+# Data Cleaning and Prep
+
+First, let's get a general idea of our data quality.
+
+```{r, fig.width=12, fig.height=10}
+plot_intro(data)
+```
+
+We can see that we do have some missing values, let's see the breakdown of attributes with missing values. Also, there are no rows where the data is present for every attribute. Lets look at missings by attribute to see if there are issues with some specific columns.
+
+```{r, fig.width=11, fig.height=12}
+plot_missing(data, group = list(Good = 0.05, OK = 0.25, Bad = 0.8, Remove
+  = 1))
+missing_data <- profile_missing(data)
+```
+
+We can see that some attributes are missing the majority of thier values--we will ignore those and keep only attributes that are at least 75% complete. This will leave us with 36 attributes before removing I.D. columns.
+
+Keep only attributes with <25% missing
+
+```{r}
+less_than_25pct_missing <- missing_data %>% filter(pct_missing < 0.25)
+
+data %<>% as.data.frame()
+data_2 <- data[,(which(names(data) %in% less_than_25pct_missing$feature))]
+```
+
+To deal with the rest of the missing records, we will replace them with the average for the cognitive status associated with the record. This should give us a decent estimate and allow us to move forward.
+
+But first we need to tag each record with the cognitive status associated with it. We can do this with the attribute dxchange, which tells us what the cognitve status was and what it changed to, allowing us to use this to mark each record with the relevant cognitve status. The attribute dx will be created to hold this value.
+
+```{r, fig.width=11, fig.height=10}
+data_2 %<>% mutate(dx = case_when(dxchange == 1 ~ "CN",
+                                  dxchange == 2 ~ "MCI",
+                                  dxchange == 3 ~ "AD",
+                                  dxchange == 4 ~ "MCI",
+                                  dxchange == 5 ~ "AD",
+                                  dxchange == 6 ~ "AD",
+                                  dxchange == 7 ~ "CN",
+                                  dxchange == 8 ~ "MCI",
+                                  dxchange == 9 ~ "CN",
+                                  TRUE ~ "NA"),
+            dx_change_description = 
+            case_when(dxchange == 1 ~ "Stable:NL to NL",
+                      dxchange == 2 ~ "Stable:MCI to MCI",
+                      dxchange == 3 ~ "Stable:AD to AD",
+                      dxchange == 4 ~ "Conv:NL to MCI",
+                      dxchange == 5 ~ "Conv:MCI to AD",
+                      dxchange == 6 ~ "Conv:NL to AD",
+                      dxchange == 7 ~ "Rev:MCI to NL",
+                      dxchange == 8 ~ "Rev:AD to MCI",
+                      dxchange == 9 ~ "Rev:AD to NL",
+                      TRUE ~ "NA"))
+```
+
+```{r, eval=FALSE}
+#Make sure the results make sense
+table(data_2$dxchange, useNA = "ifany")
+table(data_2$dx, useNA = "ifany")
+table(data_2$dx_change_description, useNA = "ifany")
+```
+
+Now we can replace missing values with the average for the cognitive status for that record.
+
+```{r, fig.width=11, fig.height=10, warning=FALSE}
+data_2 <- data_2 %>%  group_by(dx) %>%
+  mutate_all(funs(ifelse(is.na(.), mean(., na.rm = TRUE),.)))
+```
+
+Make sure we have no missing values after replacing missings with averages.
+
+```{r, fig.width=11, fig.height=12}
+plot_missing(data_2)
+```
+
+# EDA
+
+Now that we have cleaned up our data and dealt with missing values, let's get an idea of the attributes we are dealing with.
+We will start by looking at the distributions of our demographic variables. Some things to note about the data: the majority of records are male, have a marital status of married, are not hispanic/latino, do not carry any copies of the apoe4 gene, are on average 73.66659 years old, and have on average 15.97882 years of education. 
+
+Included in the data are also scores on three different neuropsychological tests administered by a clinical expert(CDR Sum of Boxes (cdrsb), ADAS13 (adas13), and  MMSE (mmse)). We also have several measures of brain structural integrity which includes several measures of volume and thickness. 
+
+ *insert list of variables and descriptions here*
+
+```{r, fig.width=11, fig.height=10}
+data_2 <- ungroup(data_2)
+data_2 <- as.data.table(data_2)
+
+data_2 %<>% mutate(apoe4 = factor(apoe4),
+                   converted = factor(converted))
+
+bar_data <- data_2 %>% select(ptgender, ptethcat, ptmarry, dx, apoe4)
+hist_data <- data_2 %>% select(c(8,10,13:27,31:36))
+
+plot_bar(bar_data, ggtheme = theme_bw())#, nrow = 2, ncol = 2)
+plot_histogram(hist_data, ggtheme = theme_bw(), nrow = 2)#, ncol = 2)
+```
+
+Next we will create boxplots for each of the continuous variables by cognitive status. Many of these boxplots reveal some large differences between the various cognitive statuses. In particular, there are large discrepencies between the statuses for the neuropsychological tests--in most cases the IQRs for AD does not overlap with any other status. We see a similar pattern with the measures of brain structural integrity, however there are many more outliers present for some of these measures.
+
+```{r, fig.width=12, fig.height=10}
+box_data <- data_2 %>% select(c(8,10,13:27,31:37))
+
+plot_boxplot(box_data, by = "dx", ggtheme = theme_bw())#, nrow = 2, ncol = 2)
+```
+
+```{r}
+data_3 <- data_2 %>% select(c(8:28,31:37))
+
+names(data_3)
+```
+
+# Correltation Analysis
+
+Below is a correlation matrix for our numeric variables.
+
+```{r, fig.width=11, fig.height=10}
+plot_correlation(data_3)
+```
+
+As can be seen, we have a lot of strong correltaion occuring between certain variables. This is almost entirely occuring between the measures of brain structural integrity. This isn't too surprising, as we would expect many of these to vary together. We also see correlations between the neuropsychological tests. Moreover, we see correlations between different variables and their baselines, which is denoted by the variable ending in bl. Based on this, we may want to consider eliminating some of these variables, however, since we don't have perfect correclation for any, doing so may remove some information.
+
+Principal component analysis may help us decide if there are any attributes that it may make sense to remove.
+
+```{r, fig.width=11, fig.height=12}
+plot_prcomp(box_data[-24], nrow = 2)#, ncol = 2)
+
+#data.pca <- prcomp(box_data[-24], center = TRUE, scale. = TRUE)
+
+#summary(data.pca)
+
+# pc1 <- data.table(data.pca$rotation[,1])
+# pc1 %<>% mutate(attribute = names(box_data[-24]))
+# 
+# ggbiplot(data.pca, groups = box_data$dx, ellipse=TRUE, varname.size = 5) +
+#   ggtitle("PCA of ADNI dataset")+
+#   scale_colour_manual(name="dx", values= c("forest green", "red3", "dark blue"))+
+#   theme_minimal()+
+#   theme(legend.position = "bottom")
+```
+
+As can be seen, the first two principal components account for over half of the variance, with the first five accounting for over two thirds. The measures of brain structural integrity and the neuropsychological tests carry the majority of the importance in the first componenet, with the demorapgic information carrying very little weight. With this in mind, coupled with some of the strong correlations, we can try to find subsets of attributes that are much smaller than the full set that should still provide good predictive power.
+
+Since what we really want to identify are those that have Alzheimer’s versus those that do not, we will change our target variable to be binary. AD will indicate records for which the cognitive status is Alzheimer’s, and No_AD will indicate all other cognitive statuses.
+
+```{r}
+data_4 <- data_3
+data_4 %<>% mutate(dx = ifelse(dx == "AD", TRUE, FALSE))
+```
+
+# Feature Selection and Engineering
+
+With the help of some feature selection and creation tools in RapidMiner, a few subsets of attributes and engineered features were identified. Each of these subsets were used to build a logistic regression model. The results for the subsets were each quite good, getting very close with each mesure, and in some cases beating the model build using all attributes. However, when taken holisitcally, using all of the attributes results in a more accurate model. Since we don't have so many attributes as to cause performance issues, going forward all variables will be used to build the models.
+
+```{r}
+data_subset1 <- data_4 %>%
+  mutate(mmse_log = log(mmse_bl),
+         cdrsb_2 = 1/cdrsb) %>%
+  mutate(cdrsb_2 = ifelse(is.infinite(cdrsb_2),0,cdrsb_2)) %>%
+  select(x_entorhinal_r_thick, cdrsb, mmse_bl, x_hippocampus_l, mmse_log, cdrsb_2, dx)
+
+data_subset2 <- data_4 %>%
+  mutate(test_total = cdrsb*adas13) %>%
+  select(test_total, dx)
+
+data_subset3 <- data_4 %>%
+  mutate(mmse_log = log(mmse_bl),
+         cdrsb_2 = 1/cdrsb,
+         test_total = cdrsb*adas13) %>%
+  mutate(cdrsb_2 = ifelse(is.infinite(cdrsb_2),0,cdrsb_2)) %>%
+  select(mmse_bl, x_entorhinal_r_thick, x_hippocampus_l, mmse_log, cdrsb_2, test_total, dx)
+
+data_subset1 %<>% mutate(rid = 1:nrow(data_4))
+data_subset2 %<>% mutate(rid = 1:nrow(data_4))
+data_subset3 %<>% mutate(rid = 1:nrow(data_4))
+```
+
+# Create train and test split
+```{r}
+data_5 <- data_4 %>% mutate(rid = 1:nrow(data_4))
+
+train <- sample_n(data_5, 7500)
+test <- data_5 %>% filter(!(rid %in% train$rid))
+
+train_rid <- train$rid
+test_rid <- test$rid
+
+train %<>% select(-rid)
+test %<>% select(-rid)
+
+score_card <- data.table(model_name = "",test_accuracy = "", 
+                         test_precision = "", 
+                         test_recall = "", test_f1 = "")
+
+train_subset1 <- data_subset1 %>% filter(rid %in% train_rid)
+test_subset1 <- data_subset1 %>% filter(rid %in% test_rid)
+
+train_subset2 <- data_subset2 %>% filter(rid %in% train_rid)
+test_subset2 <- data_subset2 %>% filter(rid %in% test_rid)
+
+train_subset3 <- data_subset3 %>% filter(rid %in% train_rid)
+test_subset3 <- data_subset3 %>% filter(rid %in% test_rid)
+
+train_subset1 %<>% select(-rid)
+test_subset1 %<>% select(-rid)
+train_subset2 %<>% select(-rid)
+test_subset2 %<>% select(-rid)
+train_subset3 %<>% select(-rid)
+test_subset3 %<>% select(-rid)
+```
+
+# Logistic Regression
+
+Logistic regression will be the first model we try. This will serve as our baseline model by which subsequent ones will be evaluated. 
+
+```{r}
+vars <- paste(colnames(train)[-28], sep = "", collapse = " + ")
+vars <- paste("dx ~ ", vars, sep = "")
+formula <- as.formula(vars)
+formula
+
+glm.fit <- glm(formula=formula, data=train, family=binomial(link="logit"))
+
+glm.train <- train
+glm.train$pred <- predict(glm.fit, newdata=train, type="response")
+glm.test <- test
+glm.test$pred <- predict(glm.fit, newdata=test, type="response")
+```
+
+After building the model we will look at the distribution of scores to see how well separated they are.
+
+```{r, fig.width=11, fig.height=11}
+ggplot(glm.train, aes(x=pred, color=dx, linetype=dx)) +
+  geom_density()
+```
+
+As can be seen, they are well separated with the positive instances concentrated on the right and the negative instances concentrated on the left. We now need to decide on a threshold. Plotting the tradoffs between precision and recall for various threshold values should help with this decision.
+
+```{r, fig.width=11, fig.height=12, warning=FALSE}
+predObj <- prediction(glm.train$pred, glm.train$dx)
+precObj <- performance(predObj, measure = 'prec')
+recObj <- performance(predObj, measure='rec')
+
+precision <- (precObj@y.values)[[1]]
+prec.x <- (precObj@x.values)[[1]]
+recall <- (recObj@y.values)[[1]]
+
+rocFrame <- data.frame(threshold=prec.x, precision=precision, recall=recall)
+
+nplot <- function(plist) {
+  n <- length(plist)
+  grid.newpage()
+  pushViewport(viewport(layout=grid.layout(n,1)))
+  vplayout= function(x,y) {viewport(layout.pos.row=x,  layout.pos.col=y)}
+  for (i in 1:n) {
+    print(plist[[i]], vp=vplayout(i,1))
+  }
+}
+ 
+pnull<- mean(as.numeric(glm.train$dx))
+
+p1 <- ggplot(rocFrame, aes(x=threshold)) +
+  geom_line(aes(y=precision/pnull)) +
+  coord_cartesian(xlim = c(0,1), ylim = c(0,10) )
+  
+p2 <- ggplot(rocFrame, aes(x=threshold)) +
+  geom_line(aes(y=recall)) + 
+  coord_cartesian(xlim = c(0,1) )
+
+nplot(list(p1,p2))
+```
+
+It appears that we can make the threshold quite high without loss in recall. A threshold of .5 likely makes sense, as the imporvement in precision appears to level off here and we do begin to see a steeper decrease in recall beyond that point.
+
+```{r}
+glm_cm_test <- table(pred=glm.test$pred>0.5, dx=glm.test$dx)
+glm_cm_train <- table(pred=glm.train$pred>0.5, dx=glm.train$dx)
+
+#cm <- with(glm.fitted,table(y=dx,pred=pred_dx))
+glm_cm_train
+
+accuracy <- sum(diag(glm_cm_train))/sum(glm_cm_train)
+precision <- glm_cm_train[2,2]/sum(glm_cm_train[,2])
+recall <- glm_cm_train[2,2]/sum(glm_cm_train[2,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+glm_cm_test
+
+accuracy <- sum(diag(glm_cm_test))/sum(glm_cm_test)
+precision <- glm_cm_test[2,2]/sum(glm_cm_test[,2])
+recall <- glm_cm_test[2,2]/sum(glm_cm_test[2,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+temp_card <- data.table(model_name = "logistic regression", test_accuracy = accuracy, 
+                        test_precision = precision, 
+                        test_recall = recall, test_f1 = f1)
+
+score_card <- rbind(score_card, temp_card)
+
+#summary(glm.fit)
+
+# kable(glm_cm_test, caption = "Confusion Matrix") %>% 
+#   kable_styling(bootstrap_options = "striped", full_width = F) %>% 
+#   column_spec(1, bold = TRUE)
+```
+
+# KNN
+
+Next we will build a KNN model. Unlike the other methods implemented in R, KNN will require us to encode our categorical variables. It is also good practice to normalize our values with KNN. We will use one-hot encoding to create indicators for each level of the categorical values.
+
+```{r}
+dmy <- dummify(data_4)
+dmy %<>% select(24:33) 
+
+data_6 <- data_4 %>% select(1,3,6:28)
+
+data_6$apoe4 %<>% as.numeric()
+data_6$mmse_bl %<>% as.numeric()
+data_6$pteducat %<>% as.numeric()
+
+data_6_n <- as.data.frame(lapply(data_6[1:24], normalize))
+data_6_dx <- data_6 %>% select(dx)
+
+data_6 <- cbind(data_6_n, dmy, data_6_dx)
+
+#str(data_6)
+
+data_6[25:34] <- lapply(data_6[25:34], as.numeric)
+
+#str(data_6)
+
+data_7 <- data_6 %>% mutate(rid = 1:nrow(data_6))
+
+knn_train <- sample_n(data_7, 7500)
+knn_test <- data_7 %>% filter(!(rid %in% knn_train$rid))
+
+knn_train %<>% select(-rid)
+knn_test %<>% select(-rid)
+```
+
+```{r}
+knn_train <- knn_train %>% mutate(dx = ifelse(dx, "TRUE", "FALSE"))
+knn_test <- knn_test %>% mutate(dx = ifelse(dx, "TRUE", "FALSE"))
+
+str(knn_train)
+
+knn_train$dx %<>% as.factor()
+knn_test$dx %<>% as.factor()
+
+train_lables <- knn_train[,35]
+test_lables <- knn_test[,35]
+
+knn_train %<>% select(-dx)
+knn_test %<>% select(-dx)
+
+#str(knn_train)
+
+knn_fit <- knn(train = knn_train, test = knn_test, cl = train_lables, k=5)
+
+tab <- table(knn_fit,test_lables)
+tab
+
+accuracy <- sum(diag(tab))/sum(tab)
+precision <- tab[1,1]/sum(tab[,1])
+recall <- tab[1,1]/sum(tab[1,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+temp_card <- data.table(model_name = "knn", test_accuracy = accuracy, 
+                        test_precision = precision, 
+                        test_recall = recall, test_f1 = f1)
+
+score_card <- rbind(score_card, temp_card)
+```
+
+# Tree Based Model
+
+Build a tree based model.
+```{r, fig.width=11, fig.height=10}
+tree_model <- rpart(formula, train)
+
+tree_train <- train
+tree_test <- test
+
+tree_train$pred <- predict(tree_model, newdata=train)
+tree_test$pred <- predict(tree_model, newdata=test)
+
+tree_cm_train <- with(tree_train,table(pred=tree_train$pred>0.5,y=dx))
+tree_cm_test <- with(tree_test,table(pred=tree_test$pred>0.5,y=dx))
+
+#train set measures and Confusion Matrix
+tree_cm_train
+
+accuracy <- sum(diag(tree_cm_train))/sum(tree_cm_train)
+precision <- tree_cm_train[1,1]/sum(tree_cm_train[,1])
+recall <- tree_cm_train[1,1]/sum(tree_cm_train[1,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+#test set measures and Confusion Matrix
+tree_cm_test
+
+accuracy <- sum(diag(tree_cm_test))/sum(tree_cm_test)
+precision <- tree_cm_test[1,1]/sum(tree_cm_test[,1])
+recall <- tree_cm_test[1,1]/sum(tree_cm_test[1,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+temp_card <- data.table(model_name = "tree", test_accuracy = accuracy, 
+                        test_precision = precision, 
+                        test_recall = recall, test_f1 = f1)
+
+score_card <- rbind(score_card, temp_card)
+
+plot(tree_model)
+text(tree_model, use.n = TRUE, cex = 0.75)
+```
+
+Overall, I'm pretty happy with these results. The model has good accuracy and the difference between the train and test measures are small, indicating we are likely not overfitting. Still, let's see if bootstrapping can improve our results.
+
+# Bagging The Tree Based Model
+
+```{r}
+#Use bootstrap samples the same size as the training set, with 100 trees.
+ntrain <- dim(train)[1]
+n <- ntrain
+ntree <- 100
+
+#Build the bootstrap samples by sampling the row indices of spamTrain with replacement. Each column of the matrix samples represents the row indices into spamTrain that comprise the bootstrap sample.
+samples <- sapply(1:ntree,
+FUN = function(iter)
+{sample(1:ntrain, size=n, replace=T)})
+
+#Train the individual decision trees and return them in a list. Note: this step can take a few minutes.
+treelist <-lapply(1:ntree,
+FUN=function(iter)
+{samp <- samples[,iter];
+rpart(formula, train[samp,])})
+
+#predict.bag assumes the underlying classifier returns decision probabilities, not decisions.
+predict.bag <- function(treelist, newdata) {
+preds <- sapply(1:length(treelist),
+FUN=function(iter) {
+predict(treelist[[iter]], newdata=newdata)})
+predsums <- rowSums(preds)
+predsums/length(treelist)
+}
+
+bagged_tree_train <- train
+bagged_tree_test <- test
+
+bagged_tree_train_result <- predict.bag(treelist, newdata=train)
+bagged_tree_test_result <- predict.bag(treelist, newdata=test)
+
+bagged_tree_train$pred <- bagged_tree_train_result
+bagged_tree_test$pred <- bagged_tree_test_result
+
+bagged_tree_train <- data.table(bagged_tree_train)
+bagged_tree_test <- data.table(bagged_tree_test)
+
+bagged_tree_cm_train <- with(bagged_tree_train,
+                             table(pred=bagged_tree_train$pred>0.5,y=dx))
+bagged_tree_cm_test <- with(bagged_tree_test,
+                            table(pred=bagged_tree_test$pred>0.5,y=dx))
+
+#train set measures and Confusion Matrix
+bagged_tree_cm_train
+
+accuracy <- sum(diag(bagged_tree_cm_train))/sum(bagged_tree_cm_train)
+precision <- bagged_tree_cm_train[1,1]/sum(bagged_tree_cm_train[,1])
+recall <- bagged_tree_cm_train[1,1]/sum(bagged_tree_cm_train[1,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+#test set measures and Confusion Matrix
+bagged_tree_cm_test
+
+accuracy <- sum(diag(bagged_tree_cm_test))/sum(bagged_tree_cm_test)
+precision <- bagged_tree_cm_test[1,1]/sum(bagged_tree_cm_test[,1])
+recall <- bagged_tree_cm_test[1,1]/sum(bagged_tree_cm_test[1,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+temp_card <- data.table(model_name = "bagged tree", test_accuracy = accuracy, 
+                        test_precision = precision, 
+                        test_recall = recall, test_f1 = f1)
+
+score_card <- rbind(score_card, temp_card)
+```
+
+# Support Vector Machines
+
+```{r}
+#Build the support vector model
+mSVMV <- ksvm(formula,data=train,kernel='rbfdot')
+
+#Use the model to predict class on held-out data.
+svm_train <- train
+svm_test <- test
+
+svm_train$pred <- predict(mSVMV,newdata=train,type='response')
+svm_test$pred <- predict(mSVMV,newdata=test,type='response')
+
+svm_cm_test <- with(svm_test,table(pred=svm_test$pred>0.5,y=dx))
+svm_cm_train <- with(svm_train,table(pred=svm_train$pred>0.5,y=dx))
+
+#train set measures and Confusion Matrix
+svm_cm_train
+
+accuracy <- sum(diag(svm_cm_train))/sum(svm_cm_train)
+precision <- svm_cm_train[1,1]/sum(svm_cm_train[,1])
+recall <- svm_cm_train[1,1]/sum(svm_cm_train[1,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+#train set measures and Confusion Matrix
+svm_cm_test
+
+accuracy <- sum(diag(svm_cm_test))/sum(svm_cm_test)
+precision <- svm_cm_test[1,1]/sum(svm_cm_test[,1])
+recall <- svm_cm_test[1,1]/sum(svm_cm_test[1,])
+f1 <- 2*((precision*recall)/(precision+recall))
+
+accuracy
+precision
+recall
+f1
+
+temp_card <- data.table(model_name = "svm", test_accuracy = accuracy, 
+                        test_precision = precision, 
+                        test_recall = recall, test_f1 = f1)
+
+score_card <- rbind(score_card, temp_card)
+```
+
+```{r}
+score_card <- score_card[-1,]
+
+score_card %<>% as.data.frame()
+score_card[,-1] <- as.data.frame(lapply(score_card[,-1], as.numeric))
+score_card[,-1] <- round(score_card[,-1],4)
+
+sc <- tableGrob(score_card)
+grid.arrange(sc)
+
+tb1 <- tableGrob(glm_cm_test)
+tb2 <- tableGrob(tab)
+tb3 <- tableGrob(tree_cm_test)
+tb4 <- tableGrob(bagged_tree_cm_test)
+tb5 <- tableGrob(svm_cm_test)
+
+grid.arrange(arrangeGrob(tb1, top = 'Logistic Regression'), arrangeGrob(tb2, top = 'KNN'), arrangeGrob(tb3, top = 'Tree'), arrangeGrob(tb4, top = 'Bagged Tree'),arrangeGrob(tb5, top = 'SVM'), top = "Confusion Matrices")
+
+```
+
+```{r, fig.width=12, fig.height=8}
+simple_roc <- function(labels, scores){
+  labels <- labels[order(scores, decreasing=TRUE)]
+  data.frame(TPR=cumsum(labels)/sum(labels), FPR=cumsum(!labels)/sum(!labels), labels)
+}
+
+tree_roc <- simple_roc(tree_test$dx==TRUE, tree_test$pred)
+bagged_roc <- simple_roc(bagged_tree_test$dx==TRUE, bagged_tree_test$pred)
+glm_roc <- simple_roc(glm.test$dx==TRUE, glm.test$pred)
+svm_roc <- simple_roc(svm_test$dx==TRUE, svm_test$pred)
+
+tree_roc %<>% mutate(name="tree")
+bagged_roc %<>% mutate(name="bagged")
+glm_roc %<>% mutate(name="logistic regrssion")
+svm_roc %<>% mutate(name="svm")
+
+roc_all <- rbind(tree_roc, bagged_roc, glm_roc, svm_roc)
+
+ggplot(roc_all, aes(x=FPR, y=TPR, color=name)) +
+  geom_point(size=1)
+
+# cols <- c("line1"="black","line2"="red","line3"="green", "line4"="blue")
+# 
+# ggplot(tree_roc, aes(x=FPR, y=TPR), color='black') +
+#   geom_point() +
+#   geom_point(data=bagged_roc, color='red') +
+#   geom_point(data=glm_roc, color='green') +
+#   geom_point(data=svm_roc, color='blue') +
+#   scale_colour_manual(name="lines",values=c(black='black', red='red', green='green',blue='blue'), labels=paste0("Int",1:4)) +
+#   theme_bw() +
+#   theme(axis.title.x = element_text(size = 15, vjust=-.2)) +
+#   theme(axis.title.y = element_text(size = 15, vjust=0.3))
+# 
+# ggplot(bagged_roc, aes(x=FPR, y=TPR, color=name)) +
+#   geom_point()
+# 
+# plot.roc(tree_test$dx==TRUE, tree_test$pred)
+# 
+# 
+# plot(roc(tree_test$dx, tree_test$pred, direction="<"),
+#      col="blue", lwd=3, main="The turtle finds its way")
+# 
+# plot(roc(glm.test$dx, glm.test$pred, direction="<"),
+#      col="red", lwd=3, main="The turtle finds its way")
+# 
+# 
+# with(tree_roc, points(1 - FPR, TPR, col=1 + labels))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
